@@ -9,6 +9,8 @@
 #pragma comment(lib, "Version.lib")
 #pragma comment(lib, "Shlwapi.lib")
 
+#include "DebugPrintWndProc.hpp"
+
 #pragma comment(linker, "/manifestdependency:\"type='win32' \
     name='Microsoft.Windows.Common-Controls' \
     version='6.0.0.0' \
@@ -16,29 +18,29 @@
     publicKeyToken='6595b64144ccf1df' \
     language='*'\"")
 
-#define MAX_LOADSTRING 100
 #define WM_NOTIFYICON (WM_USER + 100)
+constexpr int TIMER_ID_ADDTRAYICON = 100;
 
-#define CATCH_SHOW_MSGBOX()                                                         \
+#define CATCH_SHOW_MSGBOX(hWnd)                                                     \
     catch (const wil::ResultException &e)                                           \
     {                                                                               \
         wchar_t message[2048]{};                                                    \
         wil::GetFailureLogString(message, ARRAYSIZE(message), e.GetFailureInfo());  \
-        MessageBox(hWnd, message, g_szTitle, MB_ICONERROR);                         \
+        ::MessageBox(hWnd, message, g_szTitle.c_str(), MB_ICONERROR);                         \
     }
 
 #define TRACE() my::DbgPrint("{}", __FUNCTION__ "\n")
 //#define TRACE() 
 #define DBGPRINTLN(fmt, ...) my::DbgPrint(__FILE__ "(" _STRINGIZE(__LINE__) "): " fmt "\n", __VA_ARGS__)
 
+#if __cpp_designated_initializers
+#define DESIGNATED_INIT(designator) designator
+#else
+#define DESIGNATED_INIT(designator) 
+#endif
+
 using namespace std::string_literals;
 using namespace std::string_view_literals;
-
-#ifndef __cpp_lib_format
-namespace std {
-    using namespace ::fmt;
-}
-#endif
 
 namespace my
 {
@@ -71,11 +73,38 @@ namespace my
         unsigned len = ::GetModuleFileName(nullptr, fileName, ARRAYSIZE(fileName));
         return { fileName, len };
     }
+
+    inline std::wstring loadString(HINSTANCE hInstance, UINT uID)
+    {
+        LPCVOID dummy{};
+        size_t count = static_cast<size_t>(LoadStringW(hInstance, uID, (PWSTR)&dummy, 0));
+        std::wstring buffer(count, L'\0');
+        if (::LoadStringW(hInstance, uID, buffer.data(), static_cast<int>(count) + 1) > 0)
+        {
+            return buffer;
+        }
+        else
+        {
+            return {};
+        }
+    }
+
 } // namespace my
 
-HINSTANCE g_hInst;
+static HINSTANCE getHinstance() noexcept
+{
+    extern HINSTANCE g_hInst;
+
+    if (g_hInst == nullptr)
+        std::terminate();
+
+    return g_hInst;
+}
+
+#include "SplashWiindow.hpp"
+
 HHOOK g_hook;
-WCHAR g_szTitle[MAX_LOADSTRING];
+std::wstring g_szTitle;
 HWND g_hwnd;
 wil::com_ptr_t<IShellWindows> g_pSHWinds;
 
@@ -91,7 +120,7 @@ struct service_provider_t : wil::com_ptr_t<IServiceProvider, err_policy>
 {
     //using namespace wil;
     using base = wil::com_ptr_t<IServiceProvider, err_policy>;
-    using result = err_policy::result;
+    using result = typename err_policy::result;
 
     template <typename E>
     explicit service_provider_t(wil::com_ptr_t<IServiceProvider, E> x)
@@ -117,8 +146,9 @@ service_provider_t< err_policy> to_service_provider(wil::com_ptr_t<T> from)
 
 void setClipboardText(std::wstring_view ss)
 {
-    if (ss.empty())
+    if (ss.empty()) {
         return;
+    }
 
     size_t cchNeeded = ss.size() + 1;
     wil::unique_hglobal hGlobal{ GlobalAlloc(GMEM_MOVEABLE | GMEM_DDESHARE, cchNeeded * sizeof(WCHAR)) };
@@ -137,9 +167,11 @@ void setClipboardText(std::wstring_view ss)
         });
         THROW_IF_WIN32_BOOL_FALSE(EmptyClipboard());
         THROW_LAST_ERROR_IF_NULL(SetClipboardData(CF_UNICODETEXT, hGlobal.get()));
-        auto _ = hGlobal.release();
+        hGlobal.release();
     }
 }
+
+SplashWiindow g_splashWindow;
 
 void copySelectedItems(wil::com_ptr_t<IFolderView2> pfv2)
 {
@@ -165,8 +197,9 @@ void copySelectedItems(wil::com_ptr_t<IFolderView2> pfv2)
         ss.append(displayName.get());
     }
     setClipboardText(ss);
-
+    g_splashWindow.show(getHinstance(), (g_szTitle + L" Splash"s).c_str());
 }
+
 
 // Querying information from an Explorer window | The Old New Thing
 // https://devblogs.microsoft.com/oldnewthing/20040720-00/?p=38393
@@ -198,7 +231,7 @@ void traverseShellWindows(wil::com_ptr_t<IShellWindows> pSHWinds, HWND hWndTarge
             wil::unique_bstr fullname;
             pWBA->get_FullName(wil::out_param(fullname));
 
-            my::DbgPrint(L"[{}] name={}, fullname={}, hwnd={}\n", i, name.get(), fullname.get(), hWndShell);
+            my::DbgPrint(L"[{}] name={}, fullname={}, hwnd={}\n"sv, i, name.get(), fullname.get(), hWndShell);
         }
 
         if (reinterpret_cast<HWND>(hWndShell) == hWndTarget)
@@ -206,7 +239,7 @@ void traverseShellWindows(wil::com_ptr_t<IShellWindows> pSHWinds, HWND hWndTarge
             auto psp = pWBA.query<IServiceProvider>();
 
             wil::com_ptr_t<IShellBrowser> psb;
-            THROW_IF_FAILED(psp->QueryService(SID_STopLevelBrowser, __uuidof(IShellBrowser), psb.put_void()));
+            THROW_IF_FAILED(psp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&psb)));
 
             wil::com_ptr_t<IShellView> psv;
             THROW_IF_FAILED(psb->QueryActiveShellView(&psv));
@@ -221,11 +254,11 @@ void traverseShellWindows(wil::com_ptr_t<IShellWindows> pSHWinds, HWND hWndTarge
                 int itemCount{};
                 THROW_IF_FAILED(pfv2->ItemCount(SVGIO_BACKGROUND, &itemCount));
 
-                my::DbgPrint(L"[{}] viewMode={}, itemCount={}\n", i, viewMode, itemCount);
+                my::DbgPrint(L"[{}] viewMode={}, itemCount={}\n"sv, i, viewMode, itemCount);
             }
 
             copySelectedItems(pfv2);
-            my::DbgPrint(L"[{}] Copied!\n", i);
+            my::DbgPrint(L"[{}] Copied!\n"sv, i);
             break;
         }
     }
@@ -235,21 +268,22 @@ LRESULT CALLBACK lowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) no
 {
     TRACE();
 
-    if (code < HC_ACTION) return CallNextHookEx(nullptr, code, wParam, lParam);
+    if (code < HC_ACTION)
+        return CallNextHookEx(nullptr, code, wParam, lParam);
 
-    auto pKbdll = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    auto pKbdll = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
 
-    DBGPRINTLN("flags:{}, vkCode:{}", pKbdll->flags, pKbdll->vkCode);
+    DBGPRINTLN("flags:{:x}, vkCode:{:x}"sv, pKbdll->flags, pKbdll->vkCode);
 
-    if ((pKbdll->flags & LLKHF_LOWER_IL_INJECTED) == 0 && pKbdll->vkCode == 'C')
+    if ((pKbdll->flags & (LLKHF_LOWER_IL_INJECTED | LLKHF_UP)) == 0 && pKbdll->vkCode == 'C')
     {
         auto ctrlKey = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         auto shiftKey = GetAsyncKeyState(VK_SHIFT) & 0x8000;
-        DBGPRINTLN("ctrlKey:{}, shiftKey:{}", ctrlKey, shiftKey);
+        DBGPRINTLN("ctrlKey:{}, shiftKey:{}"sv, ctrlKey, shiftKey);
 
         if (ctrlKey != 0 && shiftKey != 0)
         {
-            auto hWnd{ GetFocus() };
+            auto hWnd{ GetForegroundWindow() };
             if (hWnd == nullptr) {
                 hWnd = GetForegroundWindow();
             }
@@ -259,10 +293,15 @@ LRESULT CALLBACK lowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) no
                 WCHAR className[512]{};
                 RealGetWindowClass(hWnd, className, ARRAYSIZE(className));
 
+                DBGPRINTLN(L"className:{}", className);
                 if (lstrcmp(className, targetClassName) == 0)
-                {
+                    try {
                     traverseShellWindows(g_pSHWinds, hWnd);
                     return 1;
+                }
+                catch (...)
+                {
+                    DBGPRINTLN("catch");
                 }
             }
         }
@@ -297,7 +336,7 @@ bool isWorking()
     return g_hook != nullptr;
 }
 
-void addNotifyIcon(HWND hWnd, unsigned int uID)
+bool addNotifyIcon(HWND hWnd, unsigned int uID)
 {
     TRACE();
     NOTIFYICONDATA nid{ sizeof(nid) };
@@ -306,10 +345,21 @@ void addNotifyIcon(HWND hWnd, unsigned int uID)
     nid.hWnd = hWnd;
     nid.uID = uID;
     nid.uCallbackMessage = WM_NOTIFYICON;
-    nid.hIcon = LoadIcon(g_hInst, MAKEINTRESOURCE(IDI_SMALL));
-    wcscpy_s(nid.szTip, g_szTitle);
+    nid.hIcon = LoadIcon(getHinstance(), MAKEINTRESOURCE(IDI_SMALL));
+    g_szTitle.copy(nid.szTip, std::size(nid.szTip));
 
-    THROW_HR_IF(E_FAIL, !Shell_NotifyIcon(NIM_ADD, &nid));
+    BOOL success = Shell_NotifyIcon(NIM_ADD, &nid);
+    THROW_LAST_ERROR_IF(success == FALSE && GetLastError() != ERROR_TIMEOUT);
+
+    return success != FALSE;
+}
+
+void tryAddNotifyIcon(HWND hWnd, unsigned int uID)
+{
+    if (!addNotifyIcon(hWnd, uID))
+    {
+        THROW_LAST_ERROR_IF(SetTimer(hWnd, TIMER_ID_ADDTRAYICON, 1000, nullptr) == 0);
+    }
 }
 
 void deleteNotifyIcon(HWND hWnd, unsigned int uID)
@@ -327,19 +377,28 @@ void deleteNotifyIcon(HWND hWnd, unsigned int uID)
 ATOM registerMyClass(HINSTANCE hInstance)
 {
     TRACE();
-    WNDCLASSEXW wcex{
-        sizeof(WNDCLASSEX),
-        CS_HREDRAW | CS_VREDRAW,
-        &wndProc,
+
+    WNDCLASSEXW wndClass{
+        DESIGNATED_INIT(.cbSize =) sizeof(wndClass),
+        DESIGNATED_INIT(.style =) CS_HREDRAW | CS_VREDRAW,
+        DESIGNATED_INIT(.lpfnWndProc =) &wndProc,
+        DESIGNATED_INIT(.cbClsExtra = ) 0,
+        DESIGNATED_INIT(.cbWndExtra = ) 0,
+        DESIGNATED_INIT(.hInstance =) hInstance,
+        DESIGNATED_INIT(.hIcon =) LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL)),
+        DESIGNATED_INIT(.hCursor = ) nullptr,
+        DESIGNATED_INIT(.hbrBackground = ) nullptr,
+        DESIGNATED_INIT(.lpszMenuName = ) nullptr,
+        DESIGNATED_INIT(.lpszClassName =) szWindowClass,
+        DESIGNATED_INIT(.hIconSm =) LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL)),
     };
 
-    wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
-    wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
-    wcex.lpszClassName = szWindowClass;
+    WNDCLASSEXW wndClassSplash{ SplashWiindow::wndClass() };
 
-    return RegisterClassExW(&wcex);
+    return RegisterClassExW(&wndClass) && RegisterClassExW(&wndClassSplash);
 }
+
+HINSTANCE g_hInst;
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine,
                       _In_ int nCmdShow)
@@ -352,9 +411,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     g_hInst = hInstance;
 
-    LoadStringW(hInstance, IDS_APP_TITLE, g_szTitle, MAX_LOADSTRING);
+    g_szTitle = my::loadString(hInstance, IDS_APP_TITLE);
 
-    wcscat_s(g_szTitle,
+    g_szTitle.append(
 #if _M_ARM64 
              L" (ARM64bit)"
 #elif _M_X64
@@ -364,24 +423,30 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 #endif
     );
 
-    wil::unique_mutex m{ CreateMutex(nullptr, FALSE, g_szTitle) };
+    wil::unique_mutex m{ CreateMutex(nullptr, FALSE, g_szTitle.c_str()) };
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        ::MessageBox(nullptr, L"Another instance is already running.", g_szTitle, MB_ICONEXCLAMATION);
+        ::MessageBox(nullptr, L"Another instance is already running.", g_szTitle.c_str(), MB_ICONEXCLAMATION);
         return 0;
     }
     auto hr{ CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE) };
-    //auto hr{ CoInitialize(nullptr) };
     THROW_IF_FAILED(hr);
+    auto initialized = wil::scope_exit([] { CoUninitialize(); });
 
     g_pSHWinds = wil::CoCreateInstance<ShellWindows, IShellWindows>(CLSCTX_ALL);
-    //traverseShellWindows(g_pSHWinds, FindWindow(targetClassName, nullptr));
 
     installHook();
+    auto hook = wil::scope_exit([] {
+        uninstallHook();
+        g_pSHWinds = nullptr;
+    });
 
-    registerMyClass(hInstance);
+    if (registerMyClass(hInstance) == 0)
+    {
+        THROW_LAST_ERROR();
+    }
 
-    HWND hWnd = CreateWindowW(szWindowClass, g_szTitle, 0, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr,
+    HWND hWnd = CreateWindowW(szWindowClass, g_szTitle.c_str(), 0, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr,
                               hInstance, nullptr);
 
     if (hWnd == nullptr)
@@ -389,7 +454,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         return FALSE;
     }
 
-    addNotifyIcon(hWnd, NOTIFY_UID);
+    tryAddNotifyIcon(hWnd, NOTIFY_UID);
 
     MSG msg{};
     while (GetMessage(&msg, nullptr, 0, 0))
@@ -398,7 +463,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         DispatchMessage(&msg);
     }
 
-    uninstallHook();
     deleteNotifyIcon(hWnd, NOTIFY_UID);
 
     return (int)msg.wParam;
@@ -409,15 +473,16 @@ try
 {
     WCHAR targetPath[MAX_PATH]{};
     THROW_IF_WIN32_BOOL_FALSE(SHGetSpecialFolderPath(hWnd, targetPath, CSIDL_STARTUP, FALSE));
-    StringCchCat(targetPath, ARRAYSIZE(targetPath), (L"\\"s + g_szTitle + L".lnk"s).c_str());
+
+    //THROW_IF_FAILED(StringCchCat(targetPath, ARRAYSIZE(targetPath), ((L"\\"sv + g_szTitle).append(L".lnk"s)).c_str()));
 
     auto pShellLink{ wil::CoCreateInstance<IShellLink>(CLSID_ShellLink) };
     auto pPersistFile{ pShellLink.query<IPersistFile>() };
 
     THROW_IF_FAILED(pShellLink->SetPath(my::GetModuleFileName().c_str()));
-    THROW_IF_FAILED(pPersistFile->Save(targetPath, TRUE));
+    THROW_IF_FAILED(pPersistFile->Save((targetPath + L"\\"s + g_szTitle + L".lnk"s).c_str(), TRUE));
 }
-CATCH_SHOW_MSGBOX()
+CATCH_SHOW_MSGBOX(hWnd)
 
 LRESULT CALLBACK wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) noexcept
 {
@@ -429,13 +494,13 @@ LRESULT CALLBACK wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE:
         g_hwnd = hWnd;
         s_uTaskbarRestart = RegisterWindowMessage(L"TaskbarCreated");
-        s_menu = LoadMenu(g_hInst, MAKEINTRESOURCE(IDR_MENU1));
+        s_menu = LoadMenu(getHinstance(), MAKEINTRESOURCE(IDR_MENU1));
         return DefWindowProc(hWnd, message, wParam, lParam);
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
         case ID_ROOT_ABOUT:
-            DialogBox(g_hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, &about);
+            DialogBox(getHinstance(), MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, &about);
             break;
         case ID_ROOT_REGISTERTOSTARTUPPROGRAM:
             registerToShortcut(hWnd);
@@ -458,23 +523,36 @@ LRESULT CALLBACK wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             POINT pt{};
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
-            TrackPopupMenu(GetSubMenu(s_menu, 0), TPM_LEFTALIGN, pt.x, pt.y, 0, hWnd, NULL);
+            TrackPopupMenu(GetSubMenu(s_menu, 0), TPM_LEFTALIGN, pt.x, pt.y, 0, hWnd, nullptr);
         }
         break;
         default:
             ;
         }
         return 0;
+    case WM_TIMER:
+        switch (wParam)
+        {
+        case TIMER_ID_ADDTRAYICON:
+            KillTimer(hWnd, TIMER_ID_ADDTRAYICON);
+            tryAddNotifyIcon(hWnd, NOTIFY_UID);
+            break;
+        default:
+            break;
+        }
+        return DefWindowProc(hWnd, message, wParam, lParam);
     default:
         if (message == s_uTaskbarRestart)
-            addNotifyIcon(hWnd, NOTIFY_UID);
+        {
+            tryAddNotifyIcon(hWnd, NOTIFY_UID);
+        }
         else
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
 }
 
-void getProductAndVersion(LPWSTR szCopyright, UINT uCopyrightLen, LPWSTR szProductVersion, UINT uProductVersionLen)
+auto getProductAndVersion()
 {
     WCHAR szFilename[MAX_PATH]{};
     GetModuleFileName(nullptr, szFilename, ARRAYSIZE(szFilename));
@@ -491,16 +569,23 @@ void getProductAndVersion(LPWSTR szCopyright, UINT uCopyrightLen, LPWSTR szProdu
     LPWSTR pvCopyright{}, pvProductVersion{};
     UINT iCopyrightLen{}, iProductVersionLen{};
 
-    if (!VerQueryValue(data.data(), L"\\StringFileInfo\\040004b0\\LegalCopyright", (LPVOID*)&pvCopyright,
+    if (!VerQueryValue(data.data(), LR"(\StringFileInfo\040004b0\LegalCopyright)", (LPVOID*)&pvCopyright,
         &iCopyrightLen))
         std::abort();
 
-    if (!VerQueryValue(data.data(), L"\\StringFileInfo\\040004b0\\ProductVersion", (LPVOID*)&pvProductVersion,
+    if (!VerQueryValue(data.data(), LR"(\StringFileInfo\040004b0\ProductVersion)", (LPVOID*)&pvProductVersion,
         &iProductVersionLen))
         std::abort();
 
-    wcsncpy_s(szCopyright, uCopyrightLen, pvCopyright, iCopyrightLen);
-    wcsncpy_s(szProductVersion, uProductVersionLen, pvProductVersion, iProductVersionLen);
+    struct {
+        std::wstring copyright;
+        std::wstring productVersion;
+    } result = {
+        std::wstring { pvCopyright ,iCopyrightLen },
+        std::wstring { pvProductVersion ,iProductVersionLen },
+    };
+
+    return result;
 }
 
 INT_PTR CALLBACK about(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) noexcept
@@ -509,14 +594,11 @@ INT_PTR CALLBACK about(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) no
     switch (message)
     {
     case WM_INITDIALOG: {
-        WCHAR szCopyright[MAX_LOADSTRING]{};
-        WCHAR szVersion[MAX_LOADSTRING]{};
+        auto [copyright, version] = getProductAndVersion();
 
-        getProductAndVersion(szCopyright, ARRAYSIZE(szCopyright), szVersion, ARRAYSIZE(szVersion));
-
-        SetWindowText(hDlg, g_szTitle);
-        SetWindowText(GetDlgItem(hDlg, IDC_STATIC_COPYRIGHT), szCopyright);
-        SetWindowText(GetDlgItem(hDlg, IDC_STATIC_VERSION), szVersion);
+        THROW_IF_WIN32_BOOL_FALSE(SetWindowText(hDlg, g_szTitle.c_str()));
+        THROW_IF_WIN32_BOOL_FALSE(SetDlgItemText(hDlg, IDC_STATIC_COPYRIGHT, copyright.data()));
+        THROW_IF_WIN32_BOOL_FALSE(SetDlgItemText(hDlg, IDC_STATIC_VERSION, version.data()));
 
         return (INT_PTR)TRUE;
     }

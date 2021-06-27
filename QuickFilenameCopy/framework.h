@@ -1,5 +1,6 @@
 ﻿#pragma once
 
+
 #include "targetver.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -13,15 +14,11 @@
 #include <combaseapi.h> 
 #include <shlobj.h>
 
-
-#pragma warning( push, 3 )
 #pragma warning(disable : 4471)
 //#import <mshtml.tlb> no_implementation
 //#import <shdocvw.dll> no_implementation
-#pragma warning(pop)
 
 #include <exdisp.h>
-
 
 #include <unordered_set> 
 #include <string>
@@ -29,5 +26,10 @@
 #if __cpp_lib_format
 #include <format>
 #else
+#define FMT_HEADER_ONLY 
 #include "fmt/format.h"
+
+namespace std {
+    using namespace ::fmt;
+}
 #endif
